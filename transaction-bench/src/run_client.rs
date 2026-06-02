@@ -8,6 +8,7 @@ use {
     },
     log::*,
     solana_keypair::Keypair,
+    solana_metrics::datapoint_info,
     solana_pubkey::Pubkey,
     solana_quic_definitions::{
         QUIC_MAX_STAKED_CONCURRENT_STREAMS, QUIC_MAX_UNSTAKED_CONCURRENT_STREAMS,
@@ -27,9 +28,17 @@ use {
         accounts_file::AccountsFile, blockhash_updater::BlockhashUpdater,
         leader_updater::create_leader_updater,
     },
-    std::{fmt::Debug, num::NonZeroU64, sync::Arc, time::Duration},
+    std::{
+        fmt::Debug,
+        num::NonZeroU64,
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::Duration,
+    },
     tokio::{
-        sync::{mpsc, oneshot, watch},
+        sync::{mpsc, watch},
         task::JoinHandle,
     },
     tokio_util::sync::CancellationToken,
@@ -44,17 +53,13 @@ const WORKER_CHANNEL_SIZE: usize = 20;
 /// doesn't affect TPS.
 const MAX_RECONNECT_ATTEMPTS: usize = 5;
 
+/// How often tpu-client-next reports network metrics.
+const METRICS_REPORTING_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Default number of streams per connection if stake-based computation fails.
 /// This failure happens if we use stake overrides.
 const DEFAULT_NUM_STREAMS_PER_CONNECTION: usize = 8;
 const TARGET_BATCHES_PER_SECOND: u64 = 10;
-
-pub struct RunClientStats {
-    pub send_transaction_stats: Vec<Arc<SendTransactionStats>>,
-    pub priority_fee_stats: Arc<PriorityFeeStats>,
-}
-
-pub type RunClientStatsSender = oneshot::Sender<RunClientStats>;
 
 async fn find_node_activated_stake(
     rpc_client: &Arc<RpcClient>,
@@ -126,6 +131,167 @@ where
     }
 }
 
+/// Periodically reads and resets stats from all scheduler instances, sums them,
+/// and reports the aggregate to InfluxDB under a single metric name.
+///
+/// `successfully_sent_total` accumulates a non-resetting view of the
+/// `successfully_sent` counter across all instances so the drain phase can
+/// observe stability without fighting the per-tick reset.
+#[allow(clippy::arithmetic_side_effects)]
+async fn report_aggregated_stats(
+    all_stats: Vec<Arc<SendTransactionStats>>,
+    priority_fee_stats: Arc<PriorityFeeStats>,
+    reporting_interval: Duration,
+    successfully_sent_total: Arc<AtomicU64>,
+    congestion_events_total: Arc<AtomicU64>,
+    write_error_total: Arc<AtomicU64>,
+    cancel: CancellationToken,
+) {
+    let mut interval = tokio::time::interval(reporting_interval);
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let (mut connect_error, mut connection_error, mut successfully_sent,
+                     mut congestion_events, mut write_error) = (0i64, 0i64, 0i64, 0i64, 0i64);
+                let (mut ce_reset, mut ce_cids, mut ce_timed_out, mut ce_app_closed,
+                     mut ce_transport, mut ce_version, mut ce_locally_closed) =
+                    (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+                let (mut we_stopped, mut we_closed_stream, mut we_conn_lost,
+                     mut we_zero_rtt) = (0u64, 0u64, 0u64, 0u64);
+                for stats in &all_stats {
+                    let view = stats.read_and_reset();
+                    connect_error += (view.connect_error_cids_exhausted
+                        + view.connect_error_other
+                        + view.connect_error_invalid_remote_address) as i64;
+                    ce_reset += view.connection_error_reset;
+                    ce_cids += view.connection_error_cids_exhausted;
+                    ce_timed_out += view.connection_error_timed_out;
+                    ce_app_closed += view.connection_error_application_closed;
+                    ce_transport += view.connection_error_transport_error;
+                    ce_version += view.connection_error_version_mismatch;
+                    ce_locally_closed += view.connection_error_locally_closed;
+                    connection_error += (view.connection_error_reset
+                        + view.connection_error_cids_exhausted
+                        + view.connection_error_timed_out
+                        + view.connection_error_application_closed
+                        + view.connection_error_transport_error
+                        + view.connection_error_version_mismatch
+                        + view.connection_error_locally_closed) as i64;
+                    successfully_sent += view.successfully_sent as i64;
+                    congestion_events += view.transport_congestion_events as i64;
+                    we_stopped += view.write_error_stopped;
+                    we_closed_stream += view.write_error_closed_stream;
+                    we_conn_lost += view.write_error_connection_lost;
+                    we_zero_rtt += view.write_error_zero_rtt_rejected;
+                    write_error += (view.write_error_stopped
+                        + view.write_error_closed_stream
+                        + view.write_error_connection_lost
+                        + view.write_error_zero_rtt_rejected) as i64;
+                }
+                let sent_total = successfully_sent_total
+                    .fetch_add(successfully_sent as u64, Ordering::Relaxed)
+                    + successfully_sent as u64;
+                let cong_total = congestion_events_total
+                    .fetch_add(congestion_events as u64, Ordering::Relaxed)
+                    + congestion_events as u64;
+                let werr_total = write_error_total
+                    .fetch_add(write_error as u64, Ordering::Relaxed)
+                    + write_error as u64;
+                info!(
+                    "tx-bench stats (last {}ms): sent={successfully_sent} \
+                     congestion_events={congestion_events} write_error={write_error} \
+                     connect_error={connect_error} connection_error={connection_error} \
+                     | totals: sent={sent_total} congestion_events={cong_total} \
+                     write_error={werr_total}",
+                    reporting_interval.as_millis(),
+                );
+                if connection_error > 0 {
+                    info!(
+                        "  connection_error breakdown: reset={ce_reset} \
+                         timed_out={ce_timed_out} application_closed={ce_app_closed} \
+                         transport_error={ce_transport} cids_exhausted={ce_cids} \
+                         version_mismatch={ce_version} locally_closed={ce_locally_closed}",
+                    );
+                }
+                if write_error > 0 {
+                    info!(
+                        "  write_error breakdown: stopped={we_stopped} \
+                         closed_stream={we_closed_stream} connection_lost={we_conn_lost} \
+                         zero_rtt_rejected={we_zero_rtt}",
+                    );
+                }
+                datapoint_info!(
+                    "transaction-bench-network",
+                    ("connect_error", connect_error, i64),
+                    ("connection_error", connection_error, i64),
+                    ("successfully_sent", successfully_sent, i64),
+                    ("congestion_events", congestion_events, i64),
+                    ("write_error", write_error, i64),
+                );
+
+                let (total_priority_fees, priority_fee_tx_count) =
+                    priority_fee_stats.read_and_reset();
+                datapoint_info!(
+                    "transaction-bench-priority-fees",
+                    ("total_priority_fees", total_priority_fees, i64),
+                    ("tx_count", priority_fee_tx_count, i64),
+                );
+            }
+            _ = cancel.cancelled() => break,
+        }
+    }
+}
+
+/// After the generator finishes, give tpu-client-next's worker mpsc queues and
+/// quinn send buffers a chance to flush before the schedulers tear themselves
+/// down. Returns once `successfully_sent_total` is stable across two
+/// consecutive reporter ticks, then sleeps a short fixed tail to let quinn
+/// flush bytes already handed to it.
+///
+/// `drain_timeout` is the hard wall-clock cap — the tail is clamped to the
+/// remaining budget so total time never exceeds it.
+async fn drain_in_flight(
+    successfully_sent_total: Arc<AtomicU64>,
+    reporting_interval: Duration,
+    drain_timeout: Duration,
+    tail_after_stable: Duration,
+) {
+    let start = tokio::time::Instant::now();
+    // Sleep two reporting intervals between checks so the reporter has at
+    // least one tick to flush any outstanding successfully_sent counts.
+    let stability_interval = reporting_interval.saturating_mul(2);
+    let mut last_total = successfully_sent_total.load(Ordering::Relaxed);
+    loop {
+        let remaining = drain_timeout.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            warn!(
+                "Drain phase hit the {drain_timeout:?} timeout; \
+                 successfully_sent={last_total}. Tearing down anyway."
+            );
+            return;
+        }
+        let sleep_for = stability_interval.min(remaining);
+        tokio::time::sleep(sleep_for).await;
+        let now_total = successfully_sent_total.load(Ordering::Relaxed);
+        if now_total == last_total {
+            let remaining = drain_timeout.saturating_sub(start.elapsed());
+            let tail = tail_after_stable.min(remaining);
+            info!(
+                "Drain phase reached stability at successfully_sent={last_total} after \
+                 {elapsed:?}; sleeping tail {tail:?} (cap {drain_timeout:?}).",
+                elapsed = start.elapsed(),
+            );
+            tokio::time::sleep(tail).await;
+            return;
+        }
+        last_total = now_total;
+    }
+}
+
+/// Fixed tail wait after stats stop growing. Lets quinn finish flushing bytes
+/// that were already written to its send buffer.
+const DRAIN_TAIL_AFTER_STABLE: Duration = Duration::from_secs(1);
+
 pub async fn run_client(
     rpc_client: Arc<RpcClient>,
     websocket_url: String,
@@ -138,6 +304,7 @@ pub async fn run_client(
         num_transactions,
         target_tps,
         initial_congestion_window,
+        drain_seconds,
         num_max_open_connections,
         clients_per_identity,
         workers_pull_size,
@@ -146,8 +313,6 @@ pub async fn run_client(
         priority_fee_params,
         leader_tracker,
     }: ExecutionParams,
-    stats_sender: Option<RunClientStatsSender>,
-    cancel: CancellationToken,
 ) -> Result<(), BenchClientError> {
     let validator_identities: Vec<Keypair> = staked_identity_files
         .into_iter()
@@ -241,6 +406,11 @@ pub async fn run_client(
         transaction_receivers.push(receiver);
     }
 
+    // Extra sender clones kept alive past the generator so that the schedulers
+    // don't see `None` (and start tearing down workers) until after the drain
+    // phase has had a chance to flush in-flight queues.
+    let drain_senders: Vec<mpsc::Sender<_>> = transaction_senders.clone();
+
     let priority_fee_mode = PriorityFeeMode::try_from(&priority_fee_params)
         .map_err(BenchClientError::InvalidCliArguments)?;
     let priority_fee_stats = Arc::new(PriorityFeeStats::default());
@@ -259,6 +429,7 @@ pub async fn run_client(
         workers_pull_size,
     );
 
+    let cancel = CancellationToken::new();
     let transaction_generator_task_handle =
         tokio::spawn(async move { transaction_generator.run().await });
     let config = LeaderTpuCacheServiceConfig {
@@ -285,7 +456,7 @@ pub async fn run_client(
         .await?;
 
         let stake_identity = validator_identities
-            .get(i % num_identities)
+            .get(i.checked_rem(num_identities).unwrap_or(0))
             .map(StakeIdentity::new);
         let scheduler_config = ConnectionWorkersSchedulerConfig {
             bind: BindTarget::Address(bind),
@@ -321,23 +492,48 @@ pub async fn run_client(
         scheduler_handles.push(scheduler_handle);
     }
 
-    if let Some(stats_sender) = stats_sender
-        && stats_sender
-            .send(RunClientStats {
-                send_transaction_stats: all_stats,
-                priority_fee_stats,
-            })
-            .is_err()
-    {
-        debug!("Stats receiver has been dropped.");
-    }
+    // Single metrics reporter aggregating stats across all tpu-client-next instances.
+    let successfully_sent_total = Arc::new(AtomicU64::new(0));
+    let congestion_events_total = Arc::new(AtomicU64::new(0));
+    let write_error_total = Arc::new(AtomicU64::new(0));
+    tokio::spawn(report_aggregated_stats(
+        all_stats,
+        priority_fee_stats,
+        METRICS_REPORTING_INTERVAL,
+        successfully_sent_total.clone(),
+        congestion_events_total.clone(),
+        write_error_total.clone(),
+        cancel,
+    ));
 
     join_service(transaction_generator_task_handle, "TransactionGenerator").await?;
+
+    if drain_seconds > 0 {
+        info!("Generator finished; entering drain phase (max {drain_seconds}s).");
+        drain_in_flight(
+            successfully_sent_total.clone(),
+            METRICS_REPORTING_INTERVAL,
+            Duration::from_secs(drain_seconds),
+            DRAIN_TAIL_AFTER_STABLE,
+        )
+        .await;
+    }
+    // Releasing these now closes the scheduler-side receivers and lets the
+    // tpu-client-next instances shut down cleanly.
+    drop(drain_senders);
+
     join_service(blockhash_task_handle, "BlockhashUpdater").await?;
     for (i, handle) in scheduler_handles.into_iter().enumerate() {
         let name = format!("Scheduler-{i}");
         join_service(handle, &name).await?;
     }
+
+    info!(
+        "tx-bench final: successfully_sent={} congestion_events={} write_error={}",
+        successfully_sent_total.load(Ordering::Relaxed),
+        congestion_events_total.load(Ordering::Relaxed),
+        write_error_total.load(Ordering::Relaxed),
+    );
     Ok(())
 }
 
