@@ -9968,6 +9968,7 @@ dependencies = [
  "solana-system-interface 3.0.0",
  "solana-tpu-client",
  "solana-tpu-client-next",
+ "solana-transaction-status",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util 0.7.18",

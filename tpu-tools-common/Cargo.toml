@@ -45,6 +45,7 @@ solana-tpu-client-next = { workspace = true, features = [
   "metrics",
   "websocket-node-address-service"
 ] }
+solana-transaction-status = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

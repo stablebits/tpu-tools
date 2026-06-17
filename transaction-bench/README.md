@@ -221,6 +221,52 @@ args=(
 solana-transaction-bench "${args[@]}"
 ```
 
+#### Forcing Transaction Expiry (queue-discard stress test)
+
+Use `--blockhash-stale-slots` to sign transactions with a deliberately aged blockhash instead of
+the freshest one. By default the tool uses the latest blockhash, so transactions carry the full
+validity window (the validator rejects a transaction once its blockhash is more than 150 blocks
+old) and effectively never expire while queued. With a non-zero value, the blockhash updater
+fetches — via `getBlock` — the blockhash of a block that many slots behind the tip, and re-fetches
+each tick so the signed blockhash stays a constant number of blocks old as the chain advances.
+
+The staleness is expressed in **slots (blocks)** rather than seconds on purpose: the validator's
+limit is 150 blocks, not a wall-clock duration, and block time is rarely exactly 400ms on a single
+validator (especially under load). It is also applied immediately — there is no wall-clock warmup.
+
+This stresses the validator's discard-on-age path. A leader buffers incoming transactions before
+its leader slot; if their blockhash is close to expiry, they expire while sitting in the scheduler
+queue and must be discarded instead of executed.
+
+Pick a value just under 150 (e.g. `145`). Larger values leave fewer blocks of validity, so buffered
+transactions expire sooner, but a value `>= 150` makes them arrive already-expired and get dropped
+at ingestion (never queued) instead. Tune empirically against the validator's banking-stage
+scheduler metrics:
+
+* `num_dropped_on_clean` increasing — transactions were buffered and then discarded on age. This is
+  the behavior you want to maximize.
+* `num_dropped_on_receive_age` increasing — transactions were already expired on arrival and
+  dropped at ingestion. Lower `--blockhash-stale-slots` if this dominates.
+* transactions executing normally — the blockhash is still too fresh; raise the value.
+
+Use plenty of payers and a high send rate so the queue stays deep. The target RPC must serve
+`getBlock` (e.g. `agave-validator --full-rpc-api`).
+
+```shell
+args=(
+  -u "$URL"
+  read-accounts-run
+  --accounts-file accounts.json
+  --duration 120
+  --blockhash-stale-slots 145
+  --target-tps 50000
+  --staked-identity-file "$VALIDATOR_IDENTITY"
+  --send-fanout 1
+  ws-leader-tracker
+)
+solana-transaction-bench "${args[@]}"
+```
+
 #### Use yellowstone-grpc
 
 Use `yellowstone-leader-tracker` when you want to receive slot updates from a Yellowstone gRPC

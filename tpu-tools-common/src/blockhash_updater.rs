@@ -1,12 +1,17 @@
 //! Background blockhash refresh for transaction generators.
 //!
-//! The updater polls RPC for the latest blockhash and sends changes through a
-//! [`tokio::sync::watch`] channel.
+//! The updater polls RPC and publishes blockhashes through a [`tokio::sync::watch`]
+//! channel. By default it publishes the freshest blockhash. When configured with a
+//! non-zero `stale_slots`, it instead publishes the blockhash of a block that many
+//! slots behind the tip (fetched via `getBlock`), so generated transactions carry a
+//! near-expiry blockhash and exercise the scheduler's discard-on-age path.
 
 use {
     log::*,
     solana_hash::Hash,
     solana_rpc_client::nonblocking::rpc_client::RpcClient,
+    solana_rpc_client_api::config::RpcBlockConfig,
+    solana_transaction_status::TransactionDetails,
     std::sync::Arc,
     thiserror::Error,
     tokio::{
@@ -14,6 +19,11 @@ use {
         time::{self, Duration, Instant},
     },
 };
+
+/// How many slots below the target to search for a produced block, in case the exact
+/// target slot was skipped. Generous enough to span any realistic run of skipped slots
+/// while keeping the `getBlocks` range cheap (it returns slot numbers only).
+const STALE_BLOCK_SEARCH_WINDOW: u64 = 150;
 
 /// Config was introduced for test purposes.
 #[derive(Clone, Copy, Debug)]
@@ -46,26 +56,45 @@ pub enum BlockhashUpdaterError {
     BlockhashStuck,
 }
 
-/// Polls RPC for fresh blockhashes and publishes them to a watch channel.
+/// Polls RPC for blockhashes and publishes them to a watch channel.
 ///
-/// The updater exits when all receivers for the watch channel have been
-/// dropped, or returns [`BlockhashUpdaterError::BlockhashStuck`] if RPC keeps
-/// failing or returns the same blockhash for too long.
+/// With `stale_slots == 0` it publishes the latest blockhash. With `stale_slots > 0` it
+/// publishes the blockhash of a block roughly `stale_slots` behind the current slot,
+/// re-fetched each tick so the published blockhash stays a constant number of slots old as
+/// the tip advances.
+///
+/// The updater exits when all receivers for the watch channel have been dropped, or returns
+/// [`BlockhashUpdaterError::BlockhashStuck`] if RPC keeps failing (or returns the same
+/// blockhash) for too long.
 pub struct BlockhashUpdater {
     rpc_client: Arc<RpcClient>,
     sender: watch::Sender<Hash>,
     config: BlockhashUpdaterConfig,
     last_blockhash: Hash,
+    /// Publish a blockhash this many slots (blocks) behind the tip; `0` means freshest.
+    stale_slots: u64,
 }
 
 impl BlockhashUpdater {
-    /// Creates a blockhash updater using the default polling intervals.
+    /// Creates a blockhash updater that always publishes the freshest blockhash.
     pub fn new(rpc_client: Arc<RpcClient>, sender: watch::Sender<Hash>) -> Self {
+        Self::with_stale_slots(rpc_client, sender, 0)
+    }
+
+    /// Creates a blockhash updater that publishes the blockhash of a block roughly
+    /// `stale_slots` behind the tip (via `getBlock`). `stale_slots == 0` is equivalent to
+    /// [`BlockhashUpdater::new`]. The target RPC must serve `getBlock`/`getBlocks`.
+    pub fn with_stale_slots(
+        rpc_client: Arc<RpcClient>,
+        sender: watch::Sender<Hash>,
+        stale_slots: u64,
+    ) -> Self {
         Self {
             rpc_client,
             sender,
             config: BlockhashUpdaterConfig::default(),
             last_blockhash: Hash::default(),
+            stale_slots,
         }
     }
 
@@ -80,6 +109,7 @@ impl BlockhashUpdater {
             sender,
             config,
             last_blockhash: Hash::default(),
+            stale_slots: 0,
         }
     }
 
@@ -92,7 +122,22 @@ impl BlockhashUpdater {
         while !self.sender.is_closed() {
             interval.tick().await;
 
-            if let Ok(new_blockhash) = self.rpc_client.get_latest_blockhash().await
+            let fetched = if self.stale_slots == 0 {
+                self.rpc_client.get_latest_blockhash().await.ok()
+            } else {
+                match self.fetch_aged_blockhash().await {
+                    Ok(hash) => Some(hash),
+                    Err(err) => {
+                        // Surface at warn (not debug): a persistent failure here means we keep
+                        // publishing nothing and the generator falls back to the seed blockhash,
+                        // which silently defeats the staleness. Stuck detection still trips.
+                        warn!("Failed to fetch aged blockhash: {err}");
+                        None
+                    }
+                }
+            };
+
+            if let Some(new_blockhash) = fetched
                 && new_blockhash != self.last_blockhash
             {
                 self.last_blockhash = new_blockhash;
@@ -112,6 +157,69 @@ impl BlockhashUpdater {
             }
         }
         Ok(())
+    }
+
+    /// One-shot check that the aged-blockhash path works, for failing fast at startup.
+    ///
+    /// A no-op when `stale_slots == 0`. Otherwise performs a single fetch and returns a
+    /// descriptive error (e.g. when the RPC does not serve `getBlock`) so the caller can
+    /// abort instead of silently running with fresh blockhashes.
+    pub async fn check_stale_blockhash_available(&self) -> Result<(), String> {
+        if self.stale_slots == 0 {
+            return Ok(());
+        }
+        self.fetch_aged_blockhash().await.map(|_| ())
+    }
+
+    /// Fetches the blockhash of a block roughly `stale_slots` behind the current slot, so
+    /// signed transactions carry a near-expiry blockhash. Returns a descriptive error on any
+    /// RPC failure; in the run loop the caller logs it and treats it like a missed update
+    /// (stuck detection still applies), while startup uses it to fail fast.
+    async fn fetch_aged_blockhash(&self) -> Result<Hash, String> {
+        let current_slot = self
+            .rpc_client
+            .get_slot()
+            .await
+            .map_err(|err| format!("getSlot failed: {err}"))?;
+        let target_slot = current_slot.saturating_sub(self.stale_slots);
+        // The target slot may have been skipped; find the newest produced block at or below
+        // it via `getBlocks`, which returns only the slots that actually produced a block.
+        let start_slot = target_slot.saturating_sub(STALE_BLOCK_SEARCH_WINDOW);
+        let blocks = self
+            .rpc_client
+            .get_blocks(start_slot, Some(target_slot))
+            .await
+            .map_err(|err| {
+                format!(
+                    "getBlocks({start_slot}..={target_slot}) failed: {err}. The target RPC must \
+                     serve getBlock/getBlocks; run the validator with \
+                     --enable-rpc-transaction-history."
+                )
+            })?;
+        let block_slot = *blocks
+            .last()
+            .ok_or_else(|| format!("no produced block in [{start_slot}, {target_slot}]"))?;
+        // Fetch only the block header (no transactions) since we just need its blockhash.
+        let config = RpcBlockConfig {
+            transaction_details: Some(TransactionDetails::None),
+            rewards: Some(false),
+            max_supported_transaction_version: Some(0),
+            ..RpcBlockConfig::default()
+        };
+        let block = self
+            .rpc_client
+            .get_block_with_config(block_slot, config)
+            .await
+            .map_err(|err| {
+                format!(
+                    "getBlock({block_slot}) failed: {err}. The target RPC must serve getBlock; \
+                     run the validator with --enable-rpc-transaction-history."
+                )
+            })?;
+        block
+            .blockhash
+            .parse::<Hash>()
+            .map_err(|err| format!("failed to parse blockhash of slot {block_slot}: {err}"))
     }
 }
 

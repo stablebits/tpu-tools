@@ -135,6 +135,7 @@ fn test_transactions_sending() {
                 bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
                 duration: Some(Duration::from_secs(5)),
                 num_transactions: None,
+                blockhash_stale_slots: 0,
                 target_tps: None,
                 initial_congestion_window: None,
                 drain_seconds: 0,

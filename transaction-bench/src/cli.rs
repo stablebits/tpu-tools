@@ -139,6 +139,21 @@ pub struct ExecutionParams {
 
     #[clap(
         long,
+        default_value_t = 0,
+        help = "Sign transactions with a blockhash this many slots (blocks) old instead of \
+                the freshest one. 0 (default) uses fresh blockhashes.\nThe validator rejects a \
+                transaction once its blockhash is older than 150 blocks, so a value just under \
+                150 (e.g. 145) makes transactions expire within a few blocks of being buffered, \
+                stressing the scheduler's discard-on-age path. Applied immediately by fetching a \
+                historical blockhash via getBlock (no wall-clock warmup), tracking the 150-block \
+                limit directly. A value >= 150 gets transactions dropped at ingestion instead of \
+                queued; tune by watching the validator's num_dropped_on_clean (good) vs \
+                num_dropped_on_receive_age (too stale). Requires the target RPC to serve getBlock."
+    )]
+    pub blockhash_stale_slots: u64,
+
+    #[clap(
+        long,
         value_parser = value_parser!(NonZeroU64),
         help = "Optional global target send rate in transactions per second. When set, \
                 transaction-bench switches to paced sending."
@@ -418,6 +433,7 @@ mod tests {
                 bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0),
                 duration: Some(Duration::from_secs(120)),
                 num_transactions: None,
+                blockhash_stale_slots: 0,
                 target_tps: None,
                 initial_congestion_window: None,
                 drain_seconds: 10,

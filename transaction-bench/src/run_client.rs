@@ -302,6 +302,7 @@ pub async fn run_client(
         bind,
         duration,
         num_transactions,
+        blockhash_stale_slots,
         target_tps,
         initial_congestion_window,
         drain_seconds,
@@ -393,7 +394,28 @@ pub async fn run_client(
         .await
         .expect("Blockhash request should not fail.");
     let (blockhash_sender, blockhash_receiver) = watch::channel(blockhash);
-    let blockhash_updater = BlockhashUpdater::new(rpc_client.clone(), blockhash_sender);
+    let blockhash_updater = BlockhashUpdater::with_stale_slots(
+        rpc_client.clone(),
+        blockhash_sender,
+        blockhash_stale_slots,
+    );
+    if blockhash_stale_slots > 0 {
+        // Fail fast if the aged-blockhash path doesn't work (e.g. the RPC doesn't serve
+        // getBlock); otherwise we'd silently run with fresh blockhashes and nothing expires.
+        blockhash_updater
+            .check_stale_blockhash_available()
+            .await
+            .map_err(|err| {
+                BenchClientError::InvalidCliArguments(format!(
+                    "--blockhash-stale-slots {blockhash_stale_slots} requires fetching a \
+                     historical blockhash, but the probe failed: {err}"
+                ))
+            })?;
+        info!(
+            "Signing transactions with a blockhash ~{blockhash_stale_slots} slots old (fetched \
+             via getBlock) to force expiry in the validator's queue."
+        );
+    }
 
     let blockhash_task_handle = tokio::spawn(async move { blockhash_updater.run().await });
 
