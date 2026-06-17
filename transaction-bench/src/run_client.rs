@@ -135,6 +135,7 @@ pub async fn run_client(
         staked_identity_files,
         bind,
         duration,
+        num_transactions,
         target_tps,
         num_max_open_connections,
         workers_pull_size,
@@ -245,6 +246,7 @@ pub async fn run_client(
         priority_fee_stats.clone(),
         send_batch_size,
         duration,
+        num_transactions,
         target_tps,
         workers_pull_size,
     );
