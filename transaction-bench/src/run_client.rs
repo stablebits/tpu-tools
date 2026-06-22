@@ -303,6 +303,7 @@ pub async fn run_client(
         duration,
         num_transactions,
         blockhash_stale_slots,
+        blockhash_stale_secs,
         target_tps,
         initial_congestion_window,
         drain_seconds,
@@ -394,15 +395,27 @@ pub async fn run_client(
         .await
         .expect("Blockhash request should not fail.");
     let (blockhash_sender, blockhash_receiver) = watch::channel(blockhash);
-    let blockhash_updater = BlockhashUpdater::with_stale_slots(
-        rpc_client.clone(),
-        blockhash_sender,
-        blockhash_stale_slots,
-    );
-    if blockhash_stale_slots > 0 {
+    let blockhash_updater = if blockhash_stale_secs > 0 {
+        // Delay-line mode: only getLatestBlockhash is used, so the target needs no getBlock /
+        // --enable-rpc-transaction-history. Staleness is reached by priming (below).
+        info!(
+            "Signing transactions with a blockhash ~{blockhash_stale_secs}s old via a \
+             getLatestBlockhash delay line (no getBlock required)."
+        );
+        BlockhashUpdater::with_stale_secs(
+            rpc_client.clone(),
+            blockhash_sender,
+            Duration::from_secs(blockhash_stale_secs),
+        )
+    } else if blockhash_stale_slots > 0 {
+        let updater = BlockhashUpdater::with_stale_slots(
+            rpc_client.clone(),
+            blockhash_sender,
+            blockhash_stale_slots,
+        );
         // Fail fast if the aged-blockhash path doesn't work (e.g. the RPC doesn't serve
         // getBlock); otherwise we'd silently run with fresh blockhashes and nothing expires.
-        blockhash_updater
+        updater
             .check_stale_blockhash_available()
             .await
             .map_err(|err| {
@@ -415,9 +428,23 @@ pub async fn run_client(
             "Signing transactions with a blockhash ~{blockhash_stale_slots} slots old (fetched \
              via getBlock) to force expiry in the validator's queue."
         );
-    }
+        updater
+    } else {
+        BlockhashUpdater::new(rpc_client.clone(), blockhash_sender)
+    };
 
     let blockhash_task_handle = tokio::spawn(async move { blockhash_updater.run().await });
+
+    // Delay-line mode: observe blockhashes for ~stale_secs (plus a small margin) before
+    // sending, so the generator only ever signs with a fully-aged blockhash — no fresh
+    // transactions during warmup. The --duration clock starts after this priming.
+    if blockhash_stale_secs > 0 {
+        let prime_for =
+            Duration::from_secs(blockhash_stale_secs).saturating_add(Duration::from_secs(2));
+        info!("Priming blockhash delay line for ~{blockhash_stale_secs}s before sending...");
+        tokio::time::sleep(prime_for).await;
+        info!("Blockhash delay line primed; starting transaction generator.");
+    }
 
     // Create N channels, one per tpu-client-next instance.
     let mut transaction_senders = Vec::with_capacity(num_tpu_clients);

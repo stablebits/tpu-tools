@@ -154,6 +154,22 @@ pub struct ExecutionParams {
 
     #[clap(
         long,
+        default_value_t = 0,
+        conflicts_with = "blockhash_stale_slots",
+        help = "Sign transactions with a blockhash this many SECONDS old instead of the \
+                freshest one. 0 (default) uses fresh blockhashes.\nUnlike --blockhash-stale-slots \
+                this uses only getLatestBlockhash (a delay line of observed blockhashes), so it \
+                needs nothing special on the target (no getBlock / \
+                --enable-rpc-transaction-history). The tool primes for this many seconds before \
+                it starts sending, so every transaction is uniformly aged from the first one. \
+                Set it just under the validity window (150 blocks x slot_time) so transactions \
+                expire shortly after being buffered. Mutually exclusive with \
+                --blockhash-stale-slots."
+    )]
+    pub blockhash_stale_secs: u64,
+
+    #[clap(
+        long,
         value_parser = value_parser!(NonZeroU64),
         help = "Optional global target send rate in transactions per second. When set, \
                 transaction-bench switches to paced sending."
@@ -434,6 +450,7 @@ mod tests {
                 duration: Some(Duration::from_secs(120)),
                 num_transactions: None,
                 blockhash_stale_slots: 0,
+                blockhash_stale_secs: 0,
                 target_tps: None,
                 initial_congestion_window: None,
                 drain_seconds: 10,

@@ -249,8 +249,20 @@ scheduler metrics:
   dropped at ingestion. Lower `--blockhash-stale-slots` if this dominates.
 * transactions executing normally — the blockhash is still too fresh; raise the value.
 
-Use plenty of payers and a high send rate so the queue stays deep. The target RPC must serve
-`getBlock` (e.g. `agave-validator --full-rpc-api`).
+Use plenty of payers and a high send rate so the queue stays deep. This `getBlock` mode needs the
+RPC to serve `getBlock`, which on agave requires `--enable-rpc-transaction-history` — and that flag
+can itself slow the validator under load (RocksDB write amplification), skewing the test. If you
+can't enable it, use the seconds-based delay line instead:
+
+**`--blockhash-stale-secs`** — sign with a blockhash this many *seconds* old, derived purely from
+`getLatestBlockhash` (no `getBlock`, no `--enable-rpc-transaction-history`). The tool observes the
+blockhash stream and **primes for that many seconds before it starts sending**, so every
+transaction is uniformly aged from the first one (no warmup ramp) and the `--duration` clock starts
+after priming. Set it just under the validity window — `150 blocks × slot_time` (e.g. ~22s at
+~150ms slots, ~60s at 400ms). Mutually exclusive with `--blockhash-stale-slots`. Same tuning
+metrics apply (`num_dropped_on_clean` good, `num_dropped_on_receive_age` too stale). Prefer this on
+a single local validator; use `--blockhash-stale-slots` (exact block count) when a separate
+history-serving RPC is available.
 
 ```shell
 args=(

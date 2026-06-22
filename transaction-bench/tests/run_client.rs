@@ -136,6 +136,7 @@ fn test_transactions_sending() {
                 duration: Some(Duration::from_secs(5)),
                 num_transactions: None,
                 blockhash_stale_slots: 0,
+                blockhash_stale_secs: 0,
                 target_tps: None,
                 initial_congestion_window: None,
                 drain_seconds: 0,
