@@ -1,5 +1,5 @@
 use {
-    crate::priority_fee::PriorityFeeMode,
+    crate::priority_fee::{FeeDistribution, FeeTier, PremiumPlan, PriorityFeeMode},
     clap::{Args, Parser, Subcommand, crate_description, crate_name, crate_version, value_parser},
     solana_clap_v3_utils::{
         input_parsers::parse_url_or_moniker, input_validators::normalize_to_url_if_moniker,
@@ -24,7 +24,8 @@ fn parse_and_normalize_url(addr: &str) -> Result<String, String> {
     }
 }
 
-#[derive(Parser, Debug, PartialEq, Eq)]
+// Not `Eq`: `PriorityFeeParams` carries `f64` shape parameters.
+#[derive(Parser, Debug, PartialEq)]
 #[clap(name = crate_name!(),
     version = crate_version!(),
     about = crate_description!(),
@@ -76,7 +77,8 @@ pub struct ClientCliParameters {
     pub command: Command,
 }
 
-#[derive(Subcommand, Debug, PartialEq, Eq)]
+// Not `Eq`: contains `ExecutionParams`, which carries `f64` shape parameters.
+#[derive(Subcommand, Debug, PartialEq)]
 pub enum Command {
     #[clap(about = "Create accounts without saving them and run")]
     Run {
@@ -109,7 +111,8 @@ pub enum Command {
     DeleteAccounts(DeleteAccounts),
 }
 
-#[derive(Args, Clone, Debug, PartialEq, Eq)]
+// Not `Eq`: contains `PriorityFeeParams`, which carries `f64` shape parameters.
+#[derive(Args, Clone, Debug, PartialEq)]
 #[clap(rename_all = "kebab-case")]
 pub struct ExecutionParams {
     // Cannot use value_parser to read keypair file because Keypair is not Clone.
@@ -343,21 +346,102 @@ pub fn build_cli_parameters() -> ClientCliParameters {
     ClientCliParameters::parse()
 }
 
+/// Default power-law shape (`beta`) when `--priority-fee-shape` is omitted.
+const DEFAULT_POWER_LAW_BETA: f64 = 2.0;
+/// Default Pareto shape (`alpha`) when `--priority-fee-shape` is omitted.
+const DEFAULT_PARETO_ALPHA: f64 = 1.0;
+
+/// Selects the shape of the random additional priority fee. Maps to a
+/// [`FeeDistribution`] in [`PriorityFeeMode`].
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeeDistributionKind {
+    /// Flat draw over `[0, max]` (original behavior).
+    Uniform,
+    /// Bounded power law: most txs cheap, high fees rarer as `beta` grows.
+    PowerLaw,
+    /// Bounded Pareto on `[1, max]`: heavy right tail, models real fee markets.
+    Pareto,
+    /// Weighted discrete fees from `--priority-fee-tiers`.
+    Tiered,
+    /// Exact, reproducible high-fee subset derived from `--num-transactions`
+    /// (see `--high-fee-*`). Not a random draw.
+    Premium,
+}
+
 /// CLI flags controlling the additional priority fee component. Flattened into [`ExecutionParams`];
 /// convert to a runtime [`PriorityFeeMode`] via [`TryFrom`].
-#[derive(Args, Clone, Debug, PartialEq, Eq)]
+///
+/// Not `Eq`: `--priority-fee-shape` is an `f64`.
+#[derive(Args, Clone, Debug, PartialEq)]
 #[clap(rename_all = "kebab-case")]
 pub struct PriorityFeeParams {
     #[clap(
         long,
         default_value_t = 0,
-        help = "Max additional priority fee (microlamports) on top of \
-                --compute-unit-price.\nRandom mode (default): each tx gets base + \
-                rand(0..=N).\nScheduled mode (with --priority-fee-schedule-period-ms): fee cycles \
-                0..=N,\nadvancing one step every period. 0 = no additional component.\nWhen > 0 \
-                and --compute-unit-price is unset, base defaults to 1."
+        help = "Top of the additional priority-fee range (microlamports) on top of \
+                --compute-unit-price.\nRandom mode (default): each tx draws from \
+                --priority-fee-distribution over [0, N] (uniform by default).\nScheduled mode \
+                (with --priority-fee-schedule-period-ms): fee cycles 0..=N,\nadvancing one step \
+                every period. 0 = no additional component (tiered mode ignores N).\nWhen > 0 and \
+                --compute-unit-price is unset, base defaults to 1."
     )]
     pub random_compute_unit_price_max: u64,
+
+    #[clap(
+        long,
+        default_value = "uniform",
+        help = "Shape of the random additional fee over [0, --random-compute-unit-price-max]:\n\
+                uniform (default): flat; every fee equally likely (original behavior).\n\
+                power-law: fee = max*(1 - u^(1/beta)); most txs cheap, high fees rarer.\n\
+                pareto: bounded Pareto on [1, max]; heavy right tail (models real fee markets).\n\
+                tiered: weighted discrete fees from --priority-fee-tiers.\n\
+                premium: exact, reproducible high-fee subset of --num-transactions (see \
+                --high-fee-*).\n\
+                Tune power-law/pareto with --priority-fee-shape."
+    )]
+    pub priority_fee_distribution: FeeDistributionKind,
+
+    #[clap(
+        long,
+        help = "Shape parameter for --priority-fee-distribution:\n\
+                power-law: beta > 0 (default 2.0); beta=1 is uniform, larger beta = rarer highs.\n\
+                pareto: alpha > 0 (default 1.0); smaller alpha = heavier high-fee tail.\n\
+                Must be unset for uniform and tiered."
+    )]
+    pub priority_fee_shape: Option<f64>,
+
+    #[clap(
+        long,
+        help = "Weighted fee:weight tiers for --priority-fee-distribution tiered, e.g.\n\
+                '0:90,500:9,1000:1' => 90% pay +0, 9% pay +500, 1% pay +1000 (weights are\n\
+                relative; they need not sum to 100). Fees are additional microlamports on top of\n\
+                the base --compute-unit-price; a bare 'FEE' defaults its weight to 1. Required for\n\
+                and only valid with tiered mode."
+    )]
+    pub priority_fee_tiers: Option<String>,
+
+    #[clap(
+        long,
+        help = "Additional priority fee (microlamports) charged by the premium subset in \
+                --priority-fee-distribution premium. Non-premium transactions add nothing on top \
+                of the base --compute-unit-price. Only valid in premium mode."
+    )]
+    pub high_fee_microlamports: Option<u64>,
+
+    #[clap(
+        long,
+        help = "Premium share of --num-transactions for --priority-fee-distribution premium, in \
+                (0.0, 1.0]. Premium count = round(fraction * num-transactions). Mutually exclusive \
+                with --high-fee-count."
+    )]
+    pub high_fee_fraction: Option<f64>,
+
+    #[clap(
+        long,
+        help = "Exact number of premium transactions for --priority-fee-distribution premium \
+                (must be <= --num-transactions). Mutually exclusive with --high-fee-fraction."
+    )]
+    pub high_fee_count: Option<u64>,
 
     #[clap(
         long,
@@ -372,27 +456,236 @@ pub struct PriorityFeeParams {
     pub priority_fee_schedule_period_ms: Option<NonZeroU64>,
 }
 
-/// Resolve the parsed CLI args to a [`PriorityFeeMode`], rejecting
-/// `--priority-fee-schedule-period-ms` without a positive
-/// `--random-compute-unit-price-max` (silent no-op otherwise).
-impl TryFrom<&PriorityFeeParams> for PriorityFeeMode {
-    type Error = String;
+/// Parse a `--priority-fee-tiers` spec: comma-separated `fee[:weight]` entries,
+/// e.g. `0:90,500:9,1000:1`. A bare `fee` defaults its weight to `1.0`. Weights
+/// are relative and need not sum to anything in particular; each must be
+/// positive. Empty entries (e.g. a trailing comma) are skipped.
+fn parse_fee_tiers(spec: &str) -> Result<Vec<FeeTier>, String> {
+    let mut tiers = Vec::new();
+    for entry in spec.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (fee_str, weight) = match entry.split_once(':') {
+            Some((fee_str, weight_str)) => {
+                let weight = weight_str.trim().parse::<f64>().map_err(|_| {
+                    format!("invalid weight in --priority-fee-tiers entry '{entry}'")
+                })?;
+                (fee_str.trim(), weight)
+            }
+            None => (entry, 1.0),
+        };
+        let fee = fee_str
+            .parse::<u64>()
+            .map_err(|_| format!("invalid fee in --priority-fee-tiers entry '{entry}'"))?;
+        if weight <= 0.0 || !weight.is_finite() {
+            return Err(format!(
+                "weight must be a positive, finite number in --priority-fee-tiers entry '{entry}'"
+            ));
+        }
+        tiers.push(FeeTier { fee, weight });
+    }
+    if tiers.is_empty() {
+        return Err("--priority-fee-tiers must list at least one fee:weight tier".to_string());
+    }
+    Ok(tiers)
+}
 
-    fn try_from(params: &PriorityFeeParams) -> Result<Self, Self::Error> {
-        match (
-            params.random_compute_unit_price_max,
-            params.priority_fee_schedule_period_ms,
-        ) {
-            (0, Some(_)) => Err("--priority-fee-schedule-period-ms has no effect when \
-                                 --random-compute-unit-price-max is 0; set it to a positive value"
-                .to_string()),
-            (0, None) => Ok(PriorityFeeMode::None),
-            (max, Some(period)) => Ok(PriorityFeeMode::Scheduled {
+/// Resolve the parsed CLI args to a [`PriorityFeeMode`].
+///
+/// Takes `num_transactions` because premium mode derives its premium count from
+/// it. Rejects combinations that would silently ignore a flag: scheduled mode
+/// only pairs with the default uniform range; `--priority-fee-shape` only
+/// applies to power-law/pareto; `--priority-fee-tiers` only applies to tiered;
+/// `--high-fee-*` only apply to premium; and the continuous distributions are
+/// no-ops when `--random-compute-unit-price-max` is 0 (as is scheduling, per
+/// PR #56).
+impl PriorityFeeParams {
+    pub fn to_mode(&self, num_transactions: Option<NonZeroU64>) -> Result<PriorityFeeMode, String> {
+        let max = self.random_compute_unit_price_max;
+        let distribution = self.priority_fee_distribution;
+        let shape = self.priority_fee_shape;
+        let tiers = self.priority_fee_tiers.as_deref();
+
+        // Premium is its own mode: an exact, reproducible high-fee subset
+        // derived from --num-transactions, incompatible with the random /
+        // scheduled knobs.
+        if distribution == FeeDistributionKind::Premium {
+            return self.premium_mode(num_transactions);
+        }
+
+        // The --high-fee-* knobs only mean something in premium mode.
+        if self.high_fee_microlamports.is_some()
+            || self.high_fee_fraction.is_some()
+            || self.high_fee_count.is_some()
+        {
+            return Err(
+                "--high-fee-microlamports / --high-fee-fraction / --high-fee-count \
+                        require --priority-fee-distribution premium"
+                    .to_string(),
+            );
+        }
+
+        // Scheduled is a deterministic sawtooth, orthogonal to the random
+        // distribution shapes; it only combines with the default uniform range.
+        if let Some(period) = self.priority_fee_schedule_period_ms {
+            if max == 0 {
+                return Err("--priority-fee-schedule-period-ms has no effect when \
+                            --random-compute-unit-price-max is 0; set it to a positive value"
+                    .to_string());
+            }
+            if distribution != FeeDistributionKind::Uniform || shape.is_some() || tiers.is_some() {
+                return Err(
+                    "--priority-fee-schedule-period-ms (scheduled mode) cannot be combined \
+                            with --priority-fee-distribution / --priority-fee-shape / \
+                            --priority-fee-tiers"
+                        .to_string(),
+                );
+            }
+            return Ok(PriorityFeeMode::Scheduled {
                 max,
                 period_ms: period.get(),
-            }),
-            (max, None) => Ok(PriorityFeeMode::Random { max }),
+            });
         }
+
+        // Tiered draws from an explicit fee:weight table and ignores `max`.
+        if distribution == FeeDistributionKind::Tiered {
+            if shape.is_some() {
+                return Err(
+                    "--priority-fee-shape has no effect for --priority-fee-distribution tiered"
+                        .to_string(),
+                );
+            }
+            let spec = tiers.ok_or_else(|| {
+                "--priority-fee-distribution tiered requires --priority-fee-tiers".to_string()
+            })?;
+            return Ok(PriorityFeeMode::Random(FeeDistribution::Tiered {
+                tiers: parse_fee_tiers(spec)?,
+            }));
+        }
+
+        // Outside tiered mode, a tier table is meaningless.
+        if tiers.is_some() {
+            return Err(
+                "--priority-fee-tiers requires --priority-fee-distribution tiered".to_string(),
+            );
+        }
+
+        // Continuous distributions (uniform/power-law/pareto) live on [0, max];
+        // max == 0 disables the additional component entirely.
+        if max == 0 {
+            if distribution != FeeDistributionKind::Uniform || shape.is_some() {
+                return Err(
+                    "--priority-fee-distribution / --priority-fee-shape have no effect when \
+                            --random-compute-unit-price-max is 0; set it to a positive value"
+                        .to_string(),
+                );
+            }
+            return Ok(PriorityFeeMode::None);
+        }
+
+        let distribution = match distribution {
+            FeeDistributionKind::Uniform => {
+                if shape.is_some() {
+                    return Err(
+                        "--priority-fee-shape has no effect for --priority-fee-distribution uniform"
+                            .to_string(),
+                    );
+                }
+                FeeDistribution::Uniform { max }
+            }
+            FeeDistributionKind::PowerLaw => {
+                let beta = shape.unwrap_or(DEFAULT_POWER_LAW_BETA);
+                if beta <= 0.0 || !beta.is_finite() {
+                    return Err(
+                        "--priority-fee-shape (power-law beta) must be a positive, finite number"
+                            .to_string(),
+                    );
+                }
+                FeeDistribution::PowerLaw { max, beta }
+            }
+            FeeDistributionKind::Pareto => {
+                let alpha = shape.unwrap_or(DEFAULT_PARETO_ALPHA);
+                if alpha <= 0.0 || !alpha.is_finite() {
+                    return Err(
+                        "--priority-fee-shape (pareto alpha) must be a positive, finite number"
+                            .to_string(),
+                    );
+                }
+                FeeDistribution::Pareto { max, alpha }
+            }
+            FeeDistributionKind::Tiered => unreachable!("tiered handled above"),
+            FeeDistributionKind::Premium => unreachable!("premium handled above"),
+        };
+        Ok(PriorityFeeMode::Random(distribution))
+    }
+
+    /// Build a [`PriorityFeeMode::Premium`] plan. `total` comes from
+    /// `--num-transactions`; the premium count comes from exactly one of
+    /// `--high-fee-fraction` / `--high-fee-count`. Rejects the random / scheduled
+    /// knobs, which have no meaning here.
+    #[allow(clippy::arithmetic_side_effects)]
+    fn premium_mode(
+        &self,
+        num_transactions: Option<NonZeroU64>,
+    ) -> Result<PriorityFeeMode, String> {
+        if self.random_compute_unit_price_max != 0
+            || self.priority_fee_shape.is_some()
+            || self.priority_fee_tiers.is_some()
+            || self.priority_fee_schedule_period_ms.is_some()
+        {
+            return Err("--priority-fee-distribution premium does not use \
+                        --random-compute-unit-price-max / --priority-fee-shape / \
+                        --priority-fee-tiers / --priority-fee-schedule-period-ms"
+                .to_string());
+        }
+
+        let total = num_transactions
+            .ok_or_else(|| {
+                "--priority-fee-distribution premium requires --num-transactions (the premium \
+                 count is derived from it)"
+                    .to_string()
+            })?
+            .get();
+
+        let premium_fee = self.high_fee_microlamports.ok_or_else(|| {
+            "--priority-fee-distribution premium requires --high-fee-microlamports".to_string()
+        })?;
+
+        let premium_count = match (self.high_fee_fraction, self.high_fee_count) {
+            (Some(_), Some(_)) => {
+                return Err("set only one of --high-fee-fraction or --high-fee-count".to_string());
+            }
+            (None, None) => {
+                return Err(
+                    "--priority-fee-distribution premium requires --high-fee-fraction or \
+                            --high-fee-count"
+                        .to_string(),
+                );
+            }
+            (Some(fraction), None) => {
+                if fraction <= 0.0 || !fraction.is_finite() || fraction > 1.0 {
+                    return Err("--high-fee-fraction must be in (0.0, 1.0]".to_string());
+                }
+                // round() is nearest; min() keeps it within total after rounding.
+                (fraction * total as f64).round().min(total as f64) as u64
+            }
+            (None, Some(count)) => {
+                if count > total {
+                    return Err(format!(
+                        "--high-fee-count ({count}) cannot exceed --num-transactions ({total})"
+                    ));
+                }
+                count
+            }
+        };
+
+        Ok(PriorityFeeMode::Premium(PremiumPlan {
+            total,
+            premium_count,
+            premium_fee,
+        }))
     }
 }
 
@@ -447,6 +740,12 @@ mod tests {
                 compute_unit_price: Some(1000),
                 priority_fee_params: PriorityFeeParams {
                     random_compute_unit_price_max: 0,
+                    priority_fee_distribution: FeeDistributionKind::Uniform,
+                    priority_fee_shape: None,
+                    priority_fee_tiers: None,
+                    high_fee_microlamports: None,
+                    high_fee_fraction: None,
+                    high_fee_count: None,
                     priority_fee_schedule_period_ms: None,
                 },
             },
@@ -756,35 +1055,255 @@ mod tests {
 
     #[test]
     fn test_priority_fee_params_try_into_mode() {
-        let params = |max: u64, period: Option<u64>| PriorityFeeParams {
-            random_compute_unit_price_max: max,
-            priority_fee_schedule_period_ms: period.map(|p| NonZeroU64::new(p).unwrap()),
-        };
+        use FeeDistributionKind::*;
 
-        // Random max = 0 with no schedule => None.
+        fn params(
+            max: u64,
+            period: Option<u64>,
+            distribution: FeeDistributionKind,
+            shape: Option<f64>,
+            tiers: Option<&str>,
+        ) -> PriorityFeeParams {
+            PriorityFeeParams {
+                random_compute_unit_price_max: max,
+                priority_fee_distribution: distribution,
+                priority_fee_shape: shape,
+                priority_fee_tiers: tiers.map(String::from),
+                high_fee_microlamports: None,
+                high_fee_fraction: None,
+                high_fee_count: None,
+                priority_fee_schedule_period_ms: period.map(|p| NonZeroU64::new(p).unwrap()),
+            }
+        }
+
+        // max = 0 with defaults => None.
         assert_eq!(
-            PriorityFeeMode::try_from(&params(0, None)).unwrap(),
+            params(0, None, Uniform, None, None).to_mode(None).unwrap(),
             PriorityFeeMode::None
         );
 
-        // Random max > 0 with no schedule => Random.
+        // max > 0, uniform (default) => Random(Uniform).
         assert_eq!(
-            PriorityFeeMode::try_from(&params(100, None)).unwrap(),
-            PriorityFeeMode::Random { max: 100 }
+            params(100, None, Uniform, None, None)
+                .to_mode(None)
+                .unwrap(),
+            PriorityFeeMode::Random(FeeDistribution::Uniform { max: 100 })
         );
 
-        // Random max > 0 with schedule => Scheduled.
+        // max > 0 with schedule => Scheduled.
         assert_eq!(
-            PriorityFeeMode::try_from(&params(10, Some(5))).unwrap(),
+            params(10, Some(5), Uniform, None, None)
+                .to_mode(None)
+                .unwrap(),
             PriorityFeeMode::Scheduled {
                 max: 10,
                 period_ms: 5
             }
         );
 
-        // Scheduling with random max = 0 must be rejected: silently no-op
-        // was the bug, see PR #56 review.
-        assert!(PriorityFeeMode::try_from(&params(0, Some(5))).is_err());
+        // Scheduling with max = 0 must be rejected: silently no-op was the bug,
+        // see PR #56 review.
+        assert!(
+            params(0, Some(5), Uniform, None, None)
+                .to_mode(None)
+                .is_err()
+        );
+
+        // Scheduled cannot combine with a non-uniform distribution.
+        assert!(
+            params(10, Some(5), Pareto, None, None)
+                .to_mode(None)
+                .is_err()
+        );
+
+        // power-law: --priority-fee-shape becomes beta; default applies when unset.
+        assert_eq!(
+            params(1000, None, PowerLaw, Some(3.0), None)
+                .to_mode(None)
+                .unwrap(),
+            PriorityFeeMode::Random(FeeDistribution::PowerLaw {
+                max: 1000,
+                beta: 3.0
+            })
+        );
+        assert_eq!(
+            params(1000, None, PowerLaw, None, None)
+                .to_mode(None)
+                .unwrap(),
+            PriorityFeeMode::Random(FeeDistribution::PowerLaw {
+                max: 1000,
+                beta: DEFAULT_POWER_LAW_BETA
+            })
+        );
+
+        // pareto: --priority-fee-shape becomes alpha; default applies when unset.
+        assert_eq!(
+            params(1000, None, Pareto, None, None)
+                .to_mode(None)
+                .unwrap(),
+            PriorityFeeMode::Random(FeeDistribution::Pareto {
+                max: 1000,
+                alpha: DEFAULT_PARETO_ALPHA
+            })
+        );
+
+        // Non-positive shape is rejected.
+        assert!(
+            params(1000, None, PowerLaw, Some(0.0), None)
+                .to_mode(None)
+                .is_err()
+        );
+
+        // Shape has no effect for uniform.
+        assert!(
+            params(1000, None, Uniform, Some(2.0), None)
+                .to_mode(None)
+                .is_err()
+        );
+
+        // A non-uniform distribution is a no-op when max = 0.
+        assert!(params(0, None, Pareto, None, None).to_mode(None).is_err());
+
+        // tiered parses the table and ignores max.
+        assert_eq!(
+            params(0, None, Tiered, None, Some("0:90,500:9,1000:1"))
+                .to_mode(None)
+                .unwrap(),
+            PriorityFeeMode::Random(FeeDistribution::Tiered {
+                tiers: vec![
+                    FeeTier {
+                        fee: 0,
+                        weight: 90.0
+                    },
+                    FeeTier {
+                        fee: 500,
+                        weight: 9.0
+                    },
+                    FeeTier {
+                        fee: 1000,
+                        weight: 1.0
+                    },
+                ]
+            })
+        );
+
+        // A bare fee defaults its weight to 1.
+        assert_eq!(
+            params(0, None, Tiered, None, Some("0,1000"))
+                .to_mode(None)
+                .unwrap(),
+            PriorityFeeMode::Random(FeeDistribution::Tiered {
+                tiers: vec![
+                    FeeTier {
+                        fee: 0,
+                        weight: 1.0
+                    },
+                    FeeTier {
+                        fee: 1000,
+                        weight: 1.0
+                    },
+                ]
+            })
+        );
+
+        // tiered without a table is rejected; a table outside tiered is rejected.
+        assert!(params(0, None, Tiered, None, None).to_mode(None).is_err());
+        assert!(
+            params(1000, None, Uniform, None, Some("0:1"))
+                .to_mode(None)
+                .is_err()
+        );
+        // Malformed tier specs are rejected.
+        assert!(
+            params(0, None, Tiered, None, Some("0:0"))
+                .to_mode(None)
+                .is_err(),
+            "zero weight"
+        );
+        assert!(
+            params(0, None, Tiered, None, Some("abc:1"))
+                .to_mode(None)
+                .is_err(),
+            "non-numeric fee"
+        );
+
+        // Premium mode: exact high-fee subset derived from --num-transactions.
+        fn premium(
+            microlamports: Option<u64>,
+            fraction: Option<f64>,
+            count: Option<u64>,
+        ) -> PriorityFeeParams {
+            PriorityFeeParams {
+                random_compute_unit_price_max: 0,
+                priority_fee_distribution: Premium,
+                priority_fee_shape: None,
+                priority_fee_tiers: None,
+                high_fee_microlamports: microlamports,
+                high_fee_fraction: fraction,
+                high_fee_count: count,
+                priority_fee_schedule_period_ms: None,
+            }
+        }
+        let n = NonZeroU64::new;
+
+        // fraction => premium count = round(fraction * N).
+        assert_eq!(
+            premium(Some(1000), Some(0.01), None)
+                .to_mode(n(10_000))
+                .unwrap(),
+            PriorityFeeMode::Premium(PremiumPlan {
+                total: 10_000,
+                premium_count: 100,
+                premium_fee: 1000
+            })
+        );
+        // explicit count is taken verbatim.
+        assert_eq!(
+            premium(Some(1000), None, Some(42))
+                .to_mode(n(10_000))
+                .unwrap(),
+            PriorityFeeMode::Premium(PremiumPlan {
+                total: 10_000,
+                premium_count: 42,
+                premium_fee: 1000
+            })
+        );
+        // premium requires --num-transactions, --high-fee-microlamports, and
+        // exactly one of fraction/count.
+        assert!(premium(Some(1000), Some(0.01), None).to_mode(None).is_err());
+        assert!(premium(None, Some(0.01), None).to_mode(n(100)).is_err());
+        assert!(premium(Some(1000), None, None).to_mode(n(100)).is_err());
+        assert!(
+            premium(Some(1000), Some(0.01), Some(5))
+                .to_mode(n(100))
+                .is_err()
+        );
+        // fraction must be in (0.0, 1.0]; count must be <= N.
+        assert!(
+            premium(Some(1000), Some(0.0), None)
+                .to_mode(n(100))
+                .is_err()
+        );
+        assert!(
+            premium(Some(1000), Some(1.5), None)
+                .to_mode(n(100))
+                .is_err()
+        );
+        assert!(
+            premium(Some(1000), None, Some(101))
+                .to_mode(n(100))
+                .is_err()
+        );
+
+        // --high-fee-* outside premium mode is rejected.
+        let mut high_fee_on_uniform = params(1000, None, Uniform, None, None);
+        high_fee_on_uniform.high_fee_microlamports = Some(1000);
+        assert!(high_fee_on_uniform.to_mode(n(100)).is_err());
+
+        // Premium rejects the random/scheduled knobs.
+        let mut premium_with_max = premium(Some(1000), Some(0.01), None);
+        premium_with_max.random_compute_unit_price_max = 500;
+        assert!(premium_with_max.to_mode(n(100)).is_err());
     }
 
     #[test]

@@ -29,6 +29,7 @@ pub(crate) fn generate_transfer_transaction_batch(
     priority_fee_mode: PriorityFeeMode,
     priority_fee_stats: Arc<PriorityFeeStats>,
     send_batch_size: usize,
+    batch_start_index: u64,
 ) -> JoinHandle<Vec<Vec<u8>>> {
     spawn_blocking_transaction_batch_generation("generate transfer transaction batch", move || {
         let mut txs: Vec<Vec<u8>> = Vec::with_capacity(send_batch_size);
@@ -54,7 +55,10 @@ pub(crate) fn generate_transfer_transaction_batch(
         let mut instructions = Vec::with_capacity(num_send_instructions_per_tx);
         let mut signers: Vec<&Keypair> = Vec::with_capacity(num_send_instructions_per_tx);
 
-        for _ in 0..send_batch_size {
+        for offset in 0..send_batch_size {
+            // Global send-order index of this transaction; premium mode uses it
+            // to place its evenly-strided high-fee subset deterministically.
+            let tx_index = batch_start_index.saturating_add(offset as u64);
             let tx = create_serialized_transfers(
                 &mut accounts_from_iter,
                 &mut accounts_to_iter,
@@ -68,6 +72,7 @@ pub(crate) fn generate_transfer_transaction_batch(
                 compute_unit_price,
                 &priority_fee_mode,
                 &priority_fee_stats,
+                tx_index,
                 use_txv1,
             );
             txs.push(tx);

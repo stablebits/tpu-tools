@@ -285,8 +285,19 @@ pub async fn run_client(
     // drops its own copies when it finishes.
     let drain_senders = transaction_senders.clone();
 
-    let priority_fee_mode = PriorityFeeMode::try_from(&priority_fee_params)
+    let priority_fee_mode = priority_fee_params
+        .to_mode(num_transactions)
         .map_err(BenchClientError::InvalidCliArguments)?;
+    if let PriorityFeeMode::Premium(plan) = &priority_fee_mode {
+        // total is NonZeroU64-derived, so the division is safe.
+        #[allow(clippy::arithmetic_side_effects)]
+        let premium_pct = 100.0 * plan.premium_count as f64 / plan.total as f64;
+        info!(
+            "Priority-fee premium plan: {} of {} transactions ({premium_pct:.4}%) pay +{} \
+             microlamports.",
+            plan.premium_count, plan.total, plan.premium_fee,
+        );
+    }
     let priority_fee_stats = Arc::new(PriorityFeeStats::default());
     let transaction_generator = TransactionGenerator::new(
         accounts,

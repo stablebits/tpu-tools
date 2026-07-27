@@ -308,8 +308,8 @@ mod tests {
         solana_commitment_config::CommitmentConfig,
         solana_tpu_tools_common::cli::{AccountParams, DeleteAccounts, WriteAccounts},
         solana_transaction_bench::cli::{
-            ExecutionParams, InstructionPaddingParams, PriorityFeeParams, SimpleTransferTxParams,
-            TransactionParams,
+            ExecutionParams, FeeDistributionKind, InstructionPaddingParams, PriorityFeeParams,
+            SimpleTransferTxParams, TransactionParams,
         },
         std::net::{IpAddr, Ipv4Addr, SocketAddr},
     };
@@ -341,6 +341,12 @@ mod tests {
                     compute_unit_price: None,
                     priority_fee_params: PriorityFeeParams {
                         random_compute_unit_price_max: 0,
+                        priority_fee_distribution: FeeDistributionKind::Uniform,
+                        priority_fee_shape: None,
+                        priority_fee_tiers: None,
+                        high_fee_microlamports: None,
+                        high_fee_fraction: None,
+                        high_fee_count: None,
                         priority_fee_schedule_period_ms: None,
                     },
                     leader_tracker,

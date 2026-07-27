@@ -26,8 +26,8 @@ use {
     },
     solana_transaction_bench::{
         cli::{
-            ExecutionParams, InstructionPaddingParams, PriorityFeeParams, SimpleTransferTxParams,
-            TransactionParams,
+            ExecutionParams, FeeDistributionKind, InstructionPaddingParams, PriorityFeeParams,
+            SimpleTransferTxParams, TransactionParams,
         },
         run_client::run_client,
     },
@@ -152,6 +152,12 @@ fn test_transactions_sending() {
                 compute_unit_price: Some(100),
                 priority_fee_params: PriorityFeeParams {
                     random_compute_unit_price_max: 0,
+                    priority_fee_distribution: FeeDistributionKind::Uniform,
+                    priority_fee_shape: None,
+                    priority_fee_tiers: None,
+                    high_fee_microlamports: None,
+                    high_fee_fraction: None,
+                    high_fee_count: None,
                     priority_fee_schedule_period_ms: None,
                 },
                 leader_tracker: LeaderTracker::PinnedLeaderTracker { address: tpu_addr },

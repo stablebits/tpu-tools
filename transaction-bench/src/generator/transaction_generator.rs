@@ -147,6 +147,9 @@ impl TransactionGenerator {
                 else {
                     break;
                 };
+                // Send-order index of the first transaction in this batch, used
+                // by premium mode to place its strided high-fee subset.
+                let batch_start_index = txs_scheduled;
                 txs_scheduled = txs_scheduled.saturating_add(send_batch_size as u64);
                 let transaction_params = self.transaction_params.clone();
                 let compute_unit_price = self.compute_unit_price;
@@ -182,6 +185,7 @@ impl TransactionGenerator {
                                 priority_fee_mode,
                                 priority_fee_stats,
                                 send_batch_size,
+                                batch_start_index,
                             )
                             .await
                             else {

@@ -61,6 +61,7 @@ pub(crate) fn create_serialized_transfers<'a, S, R, L>(
     compute_unit_price: Option<u64>,
     priority_fee_mode: &PriorityFeeMode,
     priority_fee_stats: &Arc<PriorityFeeStats>,
+    tx_index: u64,
     use_txv1: bool,
 ) -> Vec<u8>
 where
@@ -76,7 +77,7 @@ where
         PriorityFeeMode::None => compute_unit_price,
         _ => {
             let base = compute_unit_price.unwrap_or(1).max(1);
-            let additional = priority_fee_mode.resolve();
+            let additional = priority_fee_mode.resolve(tx_index);
             let price = base.saturating_add(additional);
             priority_fee_stats.record(price);
             Some(price)
@@ -324,6 +325,7 @@ mod tests {
             compute_unit_price,
             &PriorityFeeMode::None,
             &priority_fee_stats,
+            0,
             use_txv1,
         );
 
